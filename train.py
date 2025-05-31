@@ -1,44 +1,87 @@
-from ultralytics import YOLO
+import argparse
+import copy
+import os
+import random
+import time
+
+import numpy as np
 import torch
+from mmcv import Config
+from torchpack import distributed as dist
+from torchpack.environ import auto_set_run_dir, set_run_dir
+from torchpack.utils.config import configs
+
+from mmdet3d.apis import train_model
+from mmdet3d.datasets import build_dataset
+from mmdet3d.models import build_model
+from mmdet3d.utils import get_root_logger, convert_sync_batchnorm, recursive_eval
+
 
 def main():
-    # Using the model YOLOv8n, large models are not suitable for small classes
-    model = YOLO("D:/yolov8_project/weights/yolov8n.pt")  # 替换为 yolov8m.pt
+    dist.init()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config", metavar="FILE", help="config file")
+    parser.add_argument("--run-dir", metavar="DIR", help="run directory")
+    args, opts = parser.parse_known_args()
 
-    # Configure enhancement parameters in dataset.yaml (recommended) or pass through the train parameter
-    train_args = {
-        "data": "D:/yolov8_project/datasets/dataset.yaml",
-        "epochs": 150,
-        "batch": 8,
-        "imgsz": 1630,
-        "workers": 1,
-        # "pretrained": True,  # Use pre-training weightsUse pre-training weights
-        # "augment": True,  # Enable data enhancement
-        # "mosaic": 0.8,
-        # "fliplr": 0.5,
-        # "flipud": 0.3,
-        # "lr0": 0.003,
-        # "lrf": 0.01,
-        # "warmup_epochs": 5,
-        # "warmup_momentum": 0.8,
-        # "box": 0.05,
-        # "cls": 0.5,
-        # "dfl": 0.5,
-        # "cos_lr": True,  # Enable cosine annealing learning rate
-        # "amp": True,  # Mixed precision training
-        # "patience": 50,  # Early stop strategy
-        # "save_period": -1,  # Save the model once per training
-        # "save": True,  # Save training results
-        # "resume": False,  # Do not resume the last training
-        # "device": "cuda" if torch.cuda.is_available() else "cpu",
-    }
+    configs.load(args.config, recursive=True)
+    configs.update(opts)
+
+    cfg = Config(recursive_eval(configs), filename=args.config)
+
+    torch.backends.cudnn.benchmark = cfg.cudnn_benchmark
+    torch.cuda.set_device(dist.local_rank())
+
+    if args.run_dir is None:
+        args.run_dir = auto_set_run_dir()
+    else:
+        set_run_dir(args.run_dir)
+    cfg.run_dir = args.run_dir
+
+    # dump config
+    cfg.dump(os.path.join(cfg.run_dir, "configs.yaml"))
+
+    # init the logger before other steps
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    log_file = os.path.join(cfg.run_dir, f"{timestamp}.log")
+    logger = get_root_logger(log_file=log_file)
+
+    # log some basic info
+    logger.info(f"Config:\n{cfg.pretty_text}")
+
+    # set random seeds
+    if cfg.seed is not None:
+        logger.info(
+            f"Set random seed to {cfg.seed}, "
+            f"deterministic mode: {cfg.deterministic}"
+        )
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        torch.manual_seed(cfg.seed)
+        if cfg.deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+    datasets = [build_dataset(cfg.data.train)]
+
+    model = build_model(cfg.model)
+    model.init_weights()
+    if cfg.get("sync_bn", None):
+        if not isinstance(cfg["sync_bn"], dict):
+            cfg["sync_bn"] = dict(exclude=[])
+        model = convert_sync_batchnorm(model, exclude=cfg["sync_bn"]["exclude"])
+
+    logger.info(f"Model:\n{model}")
+    train_model(
+        model,
+        datasets,
+        cfg,
+        distributed=True,
+        validate=True,
+        timestamp=timestamp,
+    )
 
 
-    results = model.train(**train_args)
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
