@@ -1,0 +1,6 @@
+# dataset.yaml
+train: D:/yolov8_project/datasets/images/train
+val: D:/yolov8_project/datasets/images/val
+
+nc: 1  # 类别数量（例如：行人检测为 1）
+names: ['pedestrian']  # 类别名称
